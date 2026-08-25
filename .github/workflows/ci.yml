@@ -1,36 +1,171 @@
-# This is a basic workflow to help you get started with Actions
-
 name: Mock CI
 
-# Controls when the workflow will run
 on:
-  # Triggers the workflow on push or pull request events but only for the "main" branch
-  push:
-    branches: [ "main" ]
+  # Run CI when a PR is opened/updated against dev
   pull_request:
-    branches: [ "main" ]
+    branches: ["dev"]
 
-  # Allows you to run this workflow manually from the Actions tab
+  # Run after a PR is merged into dev
+  push:
+    branches: ["dev"]
+
+  # Allow manual execution
   workflow_dispatch:
 
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+permissions:
+  contents: read
+  pull-requests: write
+  security-events: write
+
+
+# ============================================================
+# 1. SECURITY + CODE QUALITY
+# ============================================================
 jobs:
-  # This workflow contains a single job called "build"
-  build:
-    # The type of runner that the job will run on
+  security:
+    name: Security & Code Quality
     runs-on: ubuntu-latest
 
-    # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
-      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      # Runs a single command using the runners shell
-      - name: Run a one-line script
-        run: echo Hello, world!
+      # --------------------------------------------------------
+      # Setup Node
+      # --------------------------------------------------------
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
 
-      # Runs a set of commands using the runners shell
-      - name: Run a multi-line script
+      # --------------------------------------------------------
+      # Install NPM dependencies
+      # --------------------------------------------------------
+      - name: Install dependencies
+        run: npm ci
+
+      # --------------------------------------------------------
+      # Check NPM / SDK dependencies for vulnerabilities
+      # --------------------------------------------------------
+      - name: NPM Security Audit
+        run: npm audit --audit-level=high
+
+      # --------------------------------------------------------
+      # SonarQube code quality + security analysis
+      # --------------------------------------------------------
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@v6
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+
+  # ============================================================
+  # 2. BUILD + TEST
+  # ============================================================
+  build:
+    name: Build & Test
+    runs-on: ubuntu-latest
+
+    # Don't build until security checks pass
+    needs: security
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # --------------------------------------------------------
+      # Setup Node
+      # --------------------------------------------------------
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      # --------------------------------------------------------
+      # Install dependencies
+      # --------------------------------------------------------
+      - name: Install dependencies
+        run: npm ci
+
+      # --------------------------------------------------------
+      # Run automated tests
+      # --------------------------------------------------------
+      - name: Run tests
+        run: npm test
+
+      # --------------------------------------------------------
+      # Build NPM application
+      # --------------------------------------------------------
+      - name: Build
+        run: npm run build
+
+      # --------------------------------------------------------
+      # Save build for deployment
+      # --------------------------------------------------------
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-build
+          path: |
+            dist/
+            build/
+            package.json
+            package-lock.json
+
+
+  # ============================================================
+  # 3. DEPLOY TO DEV
+  # ============================================================
+  deploy-dev:
+    name: Deploy to DEV
+    runs-on: ubuntu-latest
+
+    # Only deploy after build succeeds
+    needs: build
+
+    # Only deploy when code is pushed to dev.
+    # This means a PR must actually be merged before deployment.
+    if: github.ref == 'refs/heads/dev' && github.event_name == 'push'
+
+    environment:
+      name: dev
+
+    steps:
+      # --------------------------------------------------------
+      # Download the successful build
+      # --------------------------------------------------------
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: npm-build
+
+      # --------------------------------------------------------
+      # Load DEV database credentials from GitHub Secrets
+      # --------------------------------------------------------
+      - name: Configure database credentials
+        env:
+          DB_USERNAME: ${{ secrets.DEV_DB_USERNAME }}
+          DB_PASSWORD: ${{ secrets.DEV_DB_PASSWORD }}
+          DB_HOST: ${{ secrets.DEV_DB_HOST }}
         run: |
-          echo Add other actions to build,
-          echo test, and deploy your project.
+          echo "DEV database credentials loaded"
+
+      # --------------------------------------------------------
+      # Deploy application
+      # --------------------------------------------------------
+      - name: Deploy to DEV
+        env:
+          DB_USERNAME: ${{ secrets.DEV_DB_USERNAME }}
+          DB_PASSWORD: ${{ secrets.DEV_DB_PASSWORD }}
+          DB_HOST: ${{ secrets.DEV_DB_HOST }}
+        run: |
+          echo "Deploying application to DEV..."
+
+          # Replace this with your actual deployment command.
+          # Example:
+          # ./deploy.sh
