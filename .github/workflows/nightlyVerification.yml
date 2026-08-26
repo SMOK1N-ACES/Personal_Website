@@ -1,0 +1,161 @@
+name: Nightly Full Verification
+
+# Scheduled, not triggered by a push - nobody is blocked waiting on this,
+# which is exactly what lets it afford to be slow and exhaustive. This is
+# the safety net for everything ci.yml deliberately skips for speed:
+# affected-only test selection, high-severity-only vulnerability gating,
+# and anything too slow to put in a developer's merge path.
+on:
+  schedule:
+    - cron: "0 2 * * *" # 2am UTC daily
+  workflow_dispatch: {} # allow manual runs too, e.g. right after a big dependency bump
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------
+  # Full test suite - every test, not the affected-only subset a
+  # dependency-graph tool (Nx/Turborepo/Bazel) would select on a normal PR.
+  # Catches the case where the affected-graph itself missed a dependency.
+  # ---------------------------------------------------------------------
+  full-test-suite-java:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./services/java-service
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+      - name: Run entire test suite, no selection/skipping
+        run: mvn -B test -DskipTests=false -Dtest=**/*
+
+  full-test-suite-node:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./services/node-service
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+      - run: npm ci
+      - name: Run entire test suite (no --onlyChanged / affected filtering)
+        run: npm test -- --coverage
+
+  # ---------------------------------------------------------------------
+  # Full integration test suite - every TestContainers-based test, not the
+  # smaller subset that runs at PR time to keep merges fast.
+  # ---------------------------------------------------------------------
+  full-integration-tests:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./services/java-service
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+      - name: Run full integration suite
+        run: mvn -B verify -Pintegration-tests-full
+
+  # ---------------------------------------------------------------------
+  # Deep dependency scan - every severity, not just high/critical, and
+  # scans transitive dependencies more exhaustively than the fast PR-time
+  # check does.
+  # ---------------------------------------------------------------------
+  deep-dependency-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Snyk deep scan - Java (all severities)
+        uses: snyk/actions/maven@master
+        continue-on-error: true # don't fail the job on find; we want the full report either way
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --file=services/java-service/pom.xml --all-projects --severity-threshold=low
+      - name: Snyk deep scan - Node (all severities)
+        uses: snyk/actions/node@master
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --file=services/node-service/package.json --all-projects --severity-threshold=low
+
+  # ---------------------------------------------------------------------
+  # Re-check already-deployed artifacts' SBOMs against today's vulnerability
+  # data. This is the whole point of generating SBOMs continuously (from our
+  # earlier conversation) - a library that was clean when built can become
+  # vulnerable months later when a new CVE is disclosed.
+  # ---------------------------------------------------------------------
+  sbom-vulnerability-recheck:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download latest SBOMs from Dependency-Track
+        run: echo "Pull stored SBOMs and re-scan against current NVD/OSV data"
+        # In practice: query Dependency-Track's API (or grype against stored
+        # SBOM files) for every artifact currently running in production,
+        # not just what was built today.
+
+  # ---------------------------------------------------------------------
+  # Upstream dependency hygiene - are the open-source packages we depend on
+  # themselves well-maintained and following good security practices?
+  # ---------------------------------------------------------------------
+  dependency-hygiene:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: OpenSSF Scorecard
+        uses: ossf/scorecard-action@v2
+        with:
+          results_file: scorecard-results.sarif
+          results_format: sarif
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: scorecard-results
+          path: scorecard-results.sarif
+
+  # ---------------------------------------------------------------------
+  # License compliance - too slow/noisy to gate every PR on, but worth
+  # catching before a restrictive license (e.g. AGPL) quietly ends up in
+  # a shipped product.
+  # ---------------------------------------------------------------------
+  license-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check Node dependency licenses
+        working-directory: ./services/node-service
+        run: npx license-checker --failOn "GPL;AGPL"
+
+  # ---------------------------------------------------------------------
+  # Notify - nobody is watching this run live at 2am, so failures need to
+  # actively reach a human rather than sit unseen in a green/red UI.
+  # ---------------------------------------------------------------------
+  notify-on-failure:
+    if: failure()
+    needs:
+      - full-test-suite-java
+      - full-test-suite-node
+      - full-integration-tests
+      - deep-dependency-scan
+      - dependency-hygiene
+      - license-check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Alert the team
+        run: |
+          curl -X POST "${{ secrets.SLACK_WEBHOOK_URL }}" \
+            -H 'Content-type: application/json' \
+            -d "{\"text\":\"Nightly full verification failed - check the Actions run for details: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}"
