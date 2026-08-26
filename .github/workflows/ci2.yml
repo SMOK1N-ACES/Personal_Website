@@ -1,0 +1,174 @@
+name: CI
+
+# Runs on every push and PR. This workflow never deploys anything and never
+# touches production credentials - it only answers "is this change safe to merge."
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ---------------------------------------------------------------------
+  # Java service: build, unit test, ArchUnit architectural checks
+  # ---------------------------------------------------------------------
+  build-test-java:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./services/java-service
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+
+      - name: Compile
+        run: mvn -B compile
+
+      - name: Run unit tests
+        run: mvn -B test
+
+      # ArchUnit rules live as regular test classes (e.g. ArchitectureTest.java)
+      # so they run automatically as part of `mvn test` above - no separate
+      # step needed, but calling it out here for visibility in the job summary.
+      - name: Architectural constraint checks (ArchUnit)
+        run: mvn -B test -Dtest=ArchitectureTest
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: java-test-results
+          path: services/java-service/target/surefire-reports
+
+  # ---------------------------------------------------------------------
+  # Node service: install, lint, unit test
+  # ---------------------------------------------------------------------
+  build-test-node:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./services/node-service
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: services/node-service/package-lock.json
+
+      - name: Install dependencies (exact lockfile versions)
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Run unit tests
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+  # ---------------------------------------------------------------------
+  # Integration tests - real Postgres/Kafka via TestContainers.
+  # Slower, so it only runs on PRs into main, not every single push.
+  # ---------------------------------------------------------------------
+  integration-tests:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    needs: [build-test-java]
+    defaults:
+      run:
+        working-directory: ./services/java-service
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+
+      - name: Run integration tests (TestContainers spins up real Postgres/Kafka)
+        run: mvn -B verify -Pintegration-tests
+
+  # ---------------------------------------------------------------------
+  # Code quality (SonarQube) - runs against both services
+  # ---------------------------------------------------------------------
+  code-quality:
+    runs-on: ubuntu-latest
+    needs: [build-test-java, build-test-node]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # SonarQube wants full git history for blame/new-code analysis
+
+      - name: SonarQube scan
+        uses: SonarSource/sonarqube-scan-action@v4
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+  # ---------------------------------------------------------------------
+  # Dependency vulnerability scanning (Snyk) - both package ecosystems
+  # ---------------------------------------------------------------------
+  dependency-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Snyk scan - Java dependencies
+        uses: snyk/actions/maven@master
+        continue-on-error: false
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --file=services/java-service/pom.xml --severity-threshold=high
+
+      - name: Snyk scan - Node dependencies
+        uses: snyk/actions/node@master
+        continue-on-error: false
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --file=services/node-service/package.json --severity-threshold=high
+
+  # ---------------------------------------------------------------------
+  # Secrets scanning - catches accidentally committed credentials.
+  # A different failure mode than SAST/SCA above, so it's its own job.
+  # ---------------------------------------------------------------------
+  secrets-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Gitleaks scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ---------------------------------------------------------------------
+  # Infrastructure-as-code scanning - catches misconfigured Terraform/K8s
+  # before it's ever applied.
+  # ---------------------------------------------------------------------
+  iac-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkov scan
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: infra/
+          quiet: true
+          soft_fail: false
