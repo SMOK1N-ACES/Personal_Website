@@ -1,0 +1,58 @@
+name: Deploy to Staging
+
+# Automatic - no human approval required. Staging is internal-only, so the
+# cost of a bad deploy here is low, and the whole point is fast, cheap
+# feedback before anything reaches production.
+on:
+  workflow_run:
+    workflows: ["Build and Push Images"]
+    types: [completed]
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  REGISTRY: myregistry.azurecr.io
+
+jobs:
+  deploy:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [java-service, node-service]
+    steps:
+      - name: Log in to Azure (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      # Even for staging, refuse to deploy anything that wasn't produced and
+      # signed by our own build workflow.
+      - name: Verify image signature
+        run: |
+          cosign verify ${{ env.REGISTRY }}/${{ matrix.service }}:${{ github.event.workflow_run.head_sha }} \
+            --certificate-identity-regexp "https://github.com/${{ github.repository }}/.*" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
+
+      - name: Deploy to staging
+        run: |
+          az containerapp update \
+            --name ${{ matrix.service }}-staging \
+            --resource-group myRG \
+            --image ${{ env.REGISTRY }}/${{ matrix.service }}:${{ github.event.workflow_run.head_sha }}
+
+      - name: Wait for deploy to stabilize
+        run: sleep 15
+
+      - name: Run smoke tests
+        run: |
+          BASE_URL=https://${{ matrix.service }}-staging.example.com
+          curl -f "$BASE_URL/health"
+          curl -f "$BASE_URL/health/db"
