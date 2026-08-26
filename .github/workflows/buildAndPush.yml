@@ -1,0 +1,82 @@
+name: Build and Push Images
+
+# Runs after CI succeeds on main - turns approved code into deployable,
+# signed, SBOM-attached artifacts in Azure Container Registry.
+on:
+  workflow_run:
+    workflows: ["CI"]
+    branches: [main]
+    types: [completed]
+
+permissions:
+  id-token: write # required for OIDC login to Azure and for Sigstore's keyless signing
+  contents: read
+
+env:
+  REGISTRY: myregistry.azurecr.io
+
+jobs:
+  build-push-sign:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [java-service, node-service]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to Azure (OIDC, no stored password)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Log in to ACR
+        run: az acr login --name myregistry
+
+      - name: Build image
+        run: |
+          docker build \
+            -t ${{ env.REGISTRY }}/${{ matrix.service }}:${{ github.sha }} \
+            ./services/${{ matrix.service }}
+
+      - name: Push image
+        run: |
+          docker push ${{ env.REGISTRY }}/${{ matrix.service }}:${{ github.sha }}
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Install syft (SBOM generator)
+        uses: anchore/sbom-action/download-syft@v0
+
+      - name: Generate SBOM
+        run: |
+          syft ${{ env.REGISTRY }}/${{ matrix.service }}:${{ github.sha }} \
+            -o cyclonedx-json > sbom-${{ matrix.service }}.json
+
+      - name: Upload SBOM as a build artifact (for audit trail / later querying)
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ matrix.service }}-${{ github.sha }}
+          path: sbom-${{ matrix.service }}.json
+
+      - name: Attach SBOM to image
+        run: |
+          cosign attach sbom \
+            --sbom sbom-${{ matrix.service }}.json \
+            ${{ env.REGISTRY }}/${{ matrix.service }}:${{ github.sha }}
+
+      # Keyless signing: cosign authenticates via this workflow's own GitHub
+      # OIDC identity (no long-lived private key stored anywhere). The signing
+      # event itself is permanently recorded in Sigstore's public Rekor log.
+      - name: Sign image (Sigstore / cosign, keyless)
+        run: |
+          cosign sign --yes ${{ env.REGISTRY }}/${{ matrix.service }}:${{ github.sha }}
+
+      - name: Sign the attached SBOM too
+        run: |
+          cosign sign --yes \
+            --attachment sbom \
+            ${{ env.REGISTRY }}/${{ matrix.service }}:${{ github.sha }}
