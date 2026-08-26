@@ -1,0 +1,94 @@
+name: Deploy to Production
+
+# Manually triggered - a named approver has to pick which commit to deploy.
+# The `environment: production` line below is what makes GitHub pause the
+# job and require an approval click before anything below it runs.
+on:
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: "Commit SHA to deploy (must already exist as a signed image in ACR)"
+        required: true
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  REGISTRY: myregistry.azurecr.io
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production # <-- requires approval from a designated reviewer
+    strategy:
+      matrix:
+        service: [java-service, node-service]
+    steps:
+      - name: Log in to Azure (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Verify image signature before touching production
+        run: |
+          cosign verify ${{ env.REGISTRY }}/${{ matrix.service }}:${{ github.event.inputs.commit_sha }} \
+            --certificate-identity-regexp "https://github.com/${{ github.repository }}/.*" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
+
+      - name: Deploy canary revision (5% traffic)
+        id: deploy_canary
+        run: |
+          az containerapp update \
+            --name ${{ matrix.service }}-prod \
+            --resource-group myRG \
+            --image ${{ env.REGISTRY }}/${{ matrix.service }}:${{ github.event.inputs.commit_sha }}
+          az containerapp ingress traffic set \
+            --name ${{ matrix.service }}-prod \
+            --resource-group myRG \
+            --revision-weight latest=5 old=95
+
+      - name: Wait for canary to stabilize
+        run: sleep 15
+
+      - name: Run smoke tests against canary
+        id: smoke_test
+        run: |
+          curl -f https://${{ matrix.service }}.example.com/health
+
+      - name: Ramp to 100% if healthy
+        if: success()
+        run: |
+          az containerapp ingress traffic set \
+            --name ${{ matrix.service }}-prod \
+            --resource-group myRG \
+            --revision-weight latest=100 old=0
+
+      - name: Roll back canary if smoke test failed
+        if: failure()
+        run: |
+          az containerapp ingress traffic set \
+            --name ${{ matrix.service }}-prod \
+            --resource-group myRG \
+            --revision-weight latest=0 old=100
+
+      - name: Alert the team
+        if: failure()
+        run: |
+          curl -X POST "${{ secrets.SLACK_WEBHOOK_URL }}" \
+            -H 'Content-type: application/json' \
+            -d "{\"text\":\"Production deploy of ${{ matrix.service }} (${{ github.event.inputs.commit_sha }}) failed smoke test and was rolled back automatically.\"}"
+
+      - name: Record deploy in audit log
+        if: always()
+        run: |
+          echo "{\"service\":\"${{ matrix.service }}\",\"commit\":\"${{ github.event.inputs.commit_sha }}\",\"approved_by\":\"${{ github.actor }}\",\"time\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"result\":\"${{ job.status }}\"}" \
+            >> deploy-audit-log.jsonl
+          # In practice this would push to an append-only store (e.g. a
+          # write-restricted Azure Storage container or a compliance system)
+          # rather than just being logged in this ephemeral runner.
